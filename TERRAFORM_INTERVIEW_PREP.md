@@ -842,4 +842,20 @@ Provisioners run scripts on local or remote machines during resource creation or
 
 ---
 
+Alright, here's how you'd answer it naturally in an interview, start to finish:
+
+"How do you manage Terraform module updates across environments?"
+
+"So in our setup, modules live separately from the environment configurations. Each environment has its own folder with its own Terraform files, and that's where the module reference lives — including the version. So if I want to update a module, I bump the version ref in the dev environment first, raise a PR, that triggers the pipeline for dev only. Pipeline does init, plan, I review the plan output, approve, it applies. Once that looks good I do the same for staging, then prod. Each promotion is a separate PR and a separate pipeline run, so prod never gets touched until the change has been validated in lower environments first."
+
+
+Then if they ask about the pipeline structure:
+
+"We had one pipeline definition parameterised by environment rather than three separate files — less duplication. But the trigger was path-based, so a change in the dev folder only kicks off the dev pipeline run. Prod had an additional manual approval gate before apply, so even if something merged it wouldn't auto-deploy without a human signing off."
+
+
+And if they push on why sequential:
+
+"It's about change safety really. A module update could have unintended side effects — resource recreation, a drift in behaviour. You want to catch that in dev where the blast radius is low, not find out in prod. Sequential promotion with plan review at each stage is how you keep that control."
+
 *Last updated: April 2026 | Covers Terraform ~1.7+*
