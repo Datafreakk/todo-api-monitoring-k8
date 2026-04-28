@@ -1,0 +1,113 @@
+# =============================================================================
+# templates/steps/trivy-scan.yml
+# Runs a Trivy container vulnerability scan against the locally-built image.
+#
+# This is a STEPS template — it inserts steps into a parent job.
+# It does NOT define a job or stage.
+#
+# Behaviour:
+#   - Installs a pinned version of Trivy (update the version variable periodically)
+#   - Scans the locally-built image (does not pull from registry)
+#   - Ignores unfixed vulnerabilities by default (no patch available = no action possible)
+#   - Fails the build if vulnerabilities at or above the configured severity are found
+#   - Always publishes the full scan report as a pipeline artifact for audit
+#
+# Usage:
+#   steps:
+#     - template: ../steps/trivy-scan.yml
+#       parameters:
+#         severity: 'CRITICAL,HIGH'    # optional, this is the default
+#
+# References $(imageRepository) and $(imageTag) as pipeline variables —
+# no need to pass them as parameters since they're defined at pipeline level.
+# =============================================================================
+
+parameters:
+  - name: severity
+    type: string
+    default: 'CRITICAL,HIGH'
+    displayName: 'Comma-separated severity levels that fail the build (CRITICAL,HIGH,MEDIUM,LOW)'
+
+  - name: ignoreUnfixed
+    type: boolean
+    default: true
+    displayName: 'Ignore vulnerabilities that have no fix available'
+
+steps:
+  # ── Install Trivy ──────────────────────────────────────────────────────────
+  # Pinned to a specific version for reproducibility.
+  # Platform team: update TRIVY_VERSION quarterly or when critical fixes ship.
+  - bash: |
+      TRIVY_VERSION="0.50.1"
+      echo "Installing Trivy v${TRIVY_VERSION}..."
+
+      wget -q "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
+        -O /tmp/trivy.tar.gz
+
+      tar -xzf /tmp/trivy.tar.gz -C /tmp
+      sudo mv /tmp/trivy /usr/local/bin/trivy
+      trivy --version
+    displayName: 'Install Trivy'
+
+  # ── Run vulnerability scan ─────────────────────────────────────────────────
+  # Two passes:
+  #   Pass 1 — table format to stdout (human-readable, visible in pipeline logs)
+  #   Pass 2 — JSON format saved as artifact (machine-readable, audit trail)
+  # The exit code from pass 1 determines if the build passes or fails.
+  - bash: |
+      set -euo pipefail
+
+      IMAGE_REF="$(imageRepository):$(imageTag)"
+      IGNORE_FLAG=""
+      [ "$IGNORE_UNFIXED" = "True" ] && IGNORE_FLAG="--ignore-unfixed"
+
+      echo "=== Trivy Vulnerability Scan ==="
+      echo "Image:          $IMAGE_REF"
+      echo "Severity gate:  $SEVERITY"
+      echo "Ignore unfixed: $IGNORE_UNFIXED"
+      echo ""
+
+      # Pass 1: Table output for pipeline log readability
+      trivy image \
+        --format table \
+        --severity "$SEVERITY" \
+        $IGNORE_FLAG \
+        --exit-code 1 \
+        "$IMAGE_REF"
+
+    displayName: 'Trivy — fail on vulnerabilities'
+    env:
+      SEVERITY: ${{ parameters.severity }}
+      IGNORE_UNFIXED: ${{ parameters.ignoreUnfixed }}
+
+  # ── Save full scan report as artifact ──────────────────────────────────────
+  # Always runs (even if the scan failed) so teams can review the report.
+  - bash: |
+      IMAGE_REF="$(imageRepository):$(imageTag)"
+      IGNORE_FLAG=""
+      [ "$IGNORE_UNFIXED" = "True" ] && IGNORE_FLAG="--ignore-unfixed"
+
+      REPORT_DIR="$(Agent.TempDirectory)/trivy-report"
+      mkdir -p "$REPORT_DIR"
+
+      trivy image \
+        --format json \
+        --severity "CRITICAL,HIGH,MEDIUM,LOW" \
+        $IGNORE_FLAG \
+        --exit-code 0 \
+        --output "$REPORT_DIR/trivy-results.json" \
+        "$IMAGE_REF" || true
+
+      echo "Report saved: $REPORT_DIR/trivy-results.json"
+    displayName: 'Save full scan report'
+    condition: always()
+    env:
+      IGNORE_UNFIXED: ${{ parameters.ignoreUnfixed }}
+
+  - task: PublishBuildArtifacts@1
+    displayName: 'Publish scan report artifact'
+    condition: always()
+    inputs:
+      pathToPublish: '$(Agent.TempDirectory)/trivy-report'
+      artifactName: 'trivy-scan-$(Build.BuildId)'
+      publishLocation: Container

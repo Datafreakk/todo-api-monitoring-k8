@@ -1,0 +1,114 @@
+# =============================================================================
+# Example: azure-pipelines.yml
+#
+# Copy this file to your service repository root.
+# Update the parameters section for your service.
+# Do NOT copy the template files — only this file lives in your service repo.
+#
+# The pipeline templates repo is maintained by Platform Engineering.
+# Raise a PR there for any changes to the shared pipeline logic.
+# =============================================================================
+
+# ── Trigger: CI runs on PR, full CD runs on merge to main / release branches ──
+trigger:
+  branches:
+    include:
+      - main
+      - 'release/*'
+  paths:
+    exclude:
+      - '*.md'
+      - 'docs/**'
+      - '.gitignore'
+
+pr:
+  branches:
+    include:
+      - main
+  drafts: false
+
+# ── Template repo reference ────────────────────────────────────────────────────
+# IMPORTANT: Always pin to a release tag — never use 'main'.
+# This ensures your pipeline does not break when the platform team updates templates.
+# Update the tag deliberately after reviewing the changelog.
+resources:
+  repositories:
+    - repository: pipeline-templates
+      type: git
+      name: platform/pipeline-templates      # <ADO org>/<repo name>
+      ref: refs/tags/v1.0.0                  # pin to specific release tag
+
+# ── Extend the standard ACA pipeline template ─────────────────────────────────
+extends:
+  template: pipelines/aca-service.yml@pipeline-templates
+  parameters:
+
+    # ── Required: Service identity ───────────────────────────────────────────
+    # This becomes your Docker image name in ACR: mycompanyacr.azurecr.io/my-service
+    serviceName: my-service
+
+    # ── Required: Registry ───────────────────────────────────────────────────
+    # ACR name without the .azurecr.io suffix
+    acrName: mycompanyacr
+
+    # ADO service connection with AcrPush role on this ACR.
+    # Must use Workload Identity Federation — no client secrets.
+    # Created by platform team: Settings > Service Connections
+    acrServiceConnection: sc-acr-prod
+
+    # ── Required: Azure ──────────────────────────────────────────────────────
+    # ADO service connection with Contributor on the target resource groups.
+    # Must use Workload Identity Federation.
+    azureServiceConnection: sc-azure-platform
+
+    # ── Optional: Build config ───────────────────────────────────────────────
+    dockerfilePath: Dockerfile          # default
+    dockerContext: .                    # default
+
+    # Build args injected at Docker build time.
+    # Do NOT pass secrets here — use Key Vault + CSI Driver at runtime.
+    # buildArgs: 'APP_VERSION=$(Build.BuildNumber) ENVIRONMENT=production'
+
+    # ── Optional: Security ───────────────────────────────────────────────────
+    # Fail the build on CRITICAL and HIGH CVEs. Do not lower this in production.
+    trivySeverity: 'CRITICAL,HIGH'
+
+    # ── Required: Environments ───────────────────────────────────────────────
+    # Environments are deployed in the order listed.
+    # Each stage is named Deploy_{name} — use this in dependsOn for sequencing.
+    #
+    # Before first use, platform team must:
+    #   1. Create each ADO Environment: Settings > Pipelines > Environments
+    #   2. For environments requiring approval: add approval check on the ADO Environment
+    #   3. Attach ACR to ACA: az aks update --attach-acr (or equivalent for ACA)
+    #
+    environments:
+
+      # ── Dev ─────────────────────────────────────────────────────────────────
+      # Deploys automatically immediately after CI passes.
+      # No approval gate — fast feedback for developers.
+      - name: dev
+        containerAppName: my-service-dev
+        resourceGroup: rg-myapp-dev
+        dependsOn: CI_Build             # runs right after build
+        healthCheckPath: /health
+
+      # ── Staging ─────────────────────────────────────────────────────────────
+      # Deploys automatically after dev succeeds.
+      # Configure the 'staging' ADO Environment with approval checks if needed.
+      - name: staging
+        containerAppName: my-service-staging
+        resourceGroup: rg-myapp-staging
+        dependsOn: Deploy_dev           # waits for dev deployment to succeed
+        healthCheckPath: /health
+
+      # ── Production ──────────────────────────────────────────────────────────
+      # IMPORTANT: Configure the 'production' ADO Environment with required approvals.
+      #   ADO > Settings > Pipelines > Environments > production > Approvals and checks
+      #   Add: Approvals — require sign-off from senior engineer before deploy starts.
+      #   Add: Branch control — only allow deployments from main branch.
+      - name: production
+        containerAppName: my-service-prod
+        resourceGroup: rg-myapp-prod
+        dependsOn: Deploy_staging       # waits for staging deployment to succeed
+        healthCheckPath: /health

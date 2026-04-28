@@ -1,0 +1,163 @@
+# =============================================================================
+# Azure Container Apps — Company Standard Pipeline Template
+# Version: 1.0.0  |  Maintained by: Platform Engineering
+# =============================================================================
+#
+# PURPOSE
+#   Provides a standardised, production-grade CI/CD pipeline for services
+#   deployed to Azure Container Apps. Teams extend this template; they
+#   configure WHAT to deploy — the template handles HOW it deploys.
+#
+# WHAT THIS PIPELINE DOES
+#   1. CI  — Builds a Docker image tagged with the immutable Git commit SHA
+#   2. CI  — Runs a Trivy vulnerability scan; fails on CRITICAL/HIGH CVEs
+#   3. CI  — Pushes the image to ACR (main + release branches only)
+#   4. CD  — For each environment in order:
+#              a. Pauses for approval gate (if configured on ADO Environment)
+#              b. Creates a new ACA revision at 0% traffic
+#              c. Waits for the revision to reach Running state (health probes pass)
+#              d. Flips 100% traffic to the new revision
+#              e. Runs a smoke test (HTTP health check)
+#              f. If smoke test fails — automatically rolls back to previous revision
+#
+# PREREQUISITES  (platform team sets these up once per service)
+#   1. ADO Service Connections (both using Workload Identity Federation — no secrets):
+#        acrServiceConnection   → AcrPush role on the ACR
+#        azureServiceConnection → Contributor on the target resource groups
+#   2. ADO Environments (Settings > Pipelines > Environments):
+#        Create one per environment name in your environments list.
+#        Configure approval checks on environments that need human sign-off.
+#   3. ACA managed identity must have AcrPull on the ACR.
+#   4. ACA apps must exist with ingress configured before first deploy.
+#
+# USAGE
+#   In your service repo root, create azure-pipelines.yml:
+#
+#     resources:
+#       repositories:
+#         - repository: pipeline-templates
+#           type: git
+#           name: platform/pipeline-templates   # org/repo in ADO
+#           ref: refs/tags/v1.0.0               # ALWAYS pin to a release tag
+#
+#     extends:
+#       template: pipelines/aca-service.yml@pipeline-templates
+#       parameters:
+#         serviceName: my-service
+#         acrName: mycompanyacr
+#         acrServiceConnection: sc-acr-prod
+#         azureServiceConnection: sc-azure-platform
+#         environments:
+#           - name: dev
+#             containerAppName: my-service-dev
+#             resourceGroup: rg-myapp-dev
+#             dependsOn: CI_Build
+#           - name: staging
+#             containerAppName: my-service-staging
+#             resourceGroup: rg-myapp-staging
+#             dependsOn: Deploy_dev
+#           - name: production
+#             containerAppName: my-service-prod
+#             resourceGroup: rg-myapp-prod
+#             dependsOn: Deploy_staging
+#
+# =============================================================================
+
+parameters:
+
+  # ── Service identity ────────────────────────────────────────────────────────
+  - name: serviceName
+    type: string
+    displayName: 'Service name — used as the Docker image name in ACR'
+
+  # ── Registry ────────────────────────────────────────────────────────────────
+  - name: acrName
+    type: string
+    displayName: 'ACR name without .azurecr.io (e.g. mycompanyacr)'
+
+  - name: acrServiceConnection
+    type: string
+    displayName: 'ADO service connection with AcrPush on this ACR'
+
+  # ── Azure ────────────────────────────────────────────────────────────────────
+  - name: azureServiceConnection
+    type: string
+    displayName: 'ADO service connection with Contributor on target resource groups'
+
+  # ── Build ────────────────────────────────────────────────────────────────────
+  - name: dockerfilePath
+    type: string
+    default: 'Dockerfile'
+    displayName: 'Path to Dockerfile relative to repo root'
+
+  - name: dockerContext
+    type: string
+    default: '.'
+    displayName: 'Docker build context (relative to repo root)'
+
+  - name: buildArgs
+    type: string
+    default: ''
+    displayName: 'Optional Docker --build-arg values (space-separated: KEY=VALUE KEY=VALUE)'
+
+  # ── Security ─────────────────────────────────────────────────────────────────
+  - name: trivySeverity
+    type: string
+    default: 'CRITICAL,HIGH'
+    displayName: 'Comma-separated Trivy severity levels that fail the build'
+
+  # ── Environments ─────────────────────────────────────────────────────────────
+  - name: environments
+    type: object
+    displayName: |
+      Ordered list of deployment environments. Each item must have:
+        name             (string)  ADO Environment name — must exist in ADO
+        containerAppName (string)  Azure Container App resource name
+        resourceGroup    (string)  Resource group containing the Container App
+        dependsOn        (string)  Pipeline stage to depend on (e.g. CI_Build, Deploy_dev)
+        healthCheckPath  (string)  HTTP path for smoke test — default: /health
+
+# =============================================================================
+# Pipeline-level variables — available in ALL stages, jobs, and steps.
+# These are runtime values; do not try to use them as template expressions (${{...}}).
+# =============================================================================
+variables:
+  # Full image repository path — never changes for a given service
+  imageRepository: '${{ parameters.acrName }}.azurecr.io/${{ parameters.serviceName }}'
+
+  # Full Git commit SHA — immutable, traceable, never reused across commits
+  # This is the image tag that flows through every stage
+  imageTag: '$(Build.SourceVersion)'
+
+  # ACA revision suffix — must be lowercase alphanumeric with hyphens, max 10 chars
+  # Build ID is unique per run, easy to correlate in Azure Portal
+  revisionSuffix: 'b$(Build.BuildId)'
+
+# =============================================================================
+# Stages
+# =============================================================================
+stages:
+
+  # ── Stage 1: CI — Build, Scan & Push ──────────────────────────────────────
+  - template: ../templates/stages/build.yml
+    parameters:
+      serviceName: ${{ parameters.serviceName }}
+      acrName: ${{ parameters.acrName }}
+      acrServiceConnection: ${{ parameters.acrServiceConnection }}
+      dockerfilePath: ${{ parameters.dockerfilePath }}
+      dockerContext: ${{ parameters.dockerContext }}
+      buildArgs: ${{ parameters.buildArgs }}
+      trivySeverity: ${{ parameters.trivySeverity }}
+
+  # ── Stages 2+: CD — Deploy to each environment in order ───────────────────
+  # Each stage is named Deploy_{environment.name} so you can reference them
+  # in dependsOn for sequencing (e.g. dependsOn: Deploy_dev).
+  - ${{ each env in parameters.environments }}:
+    - template: ../templates/stages/deploy.yml
+      parameters:
+        environment: ${{ env.name }}
+        containerAppName: ${{ env.containerAppName }}
+        resourceGroup: ${{ env.resourceGroup }}
+        azureServiceConnection: ${{ parameters.azureServiceConnection }}
+        dependsOn: ${{ coalesce(env.dependsOn, 'CI_Build') }}
+        healthCheckPath: ${{ coalesce(env.healthCheckPath, '/health') }}

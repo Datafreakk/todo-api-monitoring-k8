@@ -1,0 +1,377 @@
+# =============================================================================
+# templates/stages/deploy.yml
+# CD stage: approve → deploy revision → flip traffic → smoke test → rollback
+#
+# Consumed by pipelines/aca-service.yml — do not reference directly.
+#
+# Deployment flow within this stage:
+#
+#   [Gate]           — Deployment job targeting the ADO Environment.
+#                      If the environment has approval checks configured in ADO,
+#                      the pipeline pauses here until a human approves.
+#                      Configure approvals in: Settings > Pipelines > Environments
+#
+#   [DeployRevision] — Creates a new ACA revision using the immutable image tag.
+#                      Starts the revision at 0% traffic (blue-green pattern).
+#                      Waits up to 6 minutes for the revision to reach Running state.
+#                      If the revision fails to start, prints container logs and fails.
+#                      Records the previous active revision for potential rollback.
+#
+#   [FlipTraffic]    — Routes 100% traffic to the new revision.
+#                      Depends on DeployRevision succeeding.
+#
+#   [SmokeTest]      — Runs an HTTP health check against the live app FQDN.
+#                      Retries 10 times with 15s intervals (~2.5 minutes total).
+#                      Fails the stage if the health endpoint does not return HTTP 200.
+#
+#   [Rollback]       — Only runs if SmokeTest fails.
+#                      Restores 100% traffic to the previous revision.
+#                      Deactivates the bad revision to free resources.
+#                      Exits with code 1 so the pipeline shows as failed (not silent).
+#
+# Output variables from DeployRevision (used by FlipTraffic and Rollback):
+#   deployStep.previousRevision — the revision that had 100% traffic before this deploy
+#
+# The new revision name is computed independently in each job as:
+#   {containerAppName}--{revisionSuffix}   where revisionSuffix = $(revisionSuffix)
+# =============================================================================
+
+parameters:
+  - name: environment
+    type: string
+    displayName: 'ADO Environment name (must exist in ADO Settings > Pipelines > Environments)'
+
+  - name: containerAppName
+    type: string
+    displayName: 'Azure Container App resource name'
+
+  - name: resourceGroup
+    type: string
+    displayName: 'Resource group containing the Container App'
+
+  - name: azureServiceConnection
+    type: string
+    displayName: 'ADO service connection for Azure CLI commands'
+
+  - name: dependsOn
+    type: string
+    default: 'CI_Build'
+    displayName: 'Stage name this deploy stage depends on'
+
+  - name: healthCheckPath
+    type: string
+    default: '/health'
+    displayName: 'HTTP path for smoke test (must return 200 on success)'
+
+stages:
+  - stage: Deploy_${{ parameters.environment }}
+    displayName: 'Deploy — ${{ parameters.environment }}'
+    dependsOn: ${{ parameters.dependsOn }}
+    # Only deploy from main or release branches — never from feature branches or PRs
+    condition: |
+      and(
+        succeeded(),
+        or(
+          eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+          startsWith(variables['Build.SourceBranch'], 'refs/heads/release/')
+        )
+      )
+    jobs:
+
+      # ── Job 1: Approval gate ────────────────────────────────────────────────
+      # Using a deployment job (not a regular job) is what ties to an ADO Environment.
+      # The approval check lives on the ADO Environment — not in this YAML.
+      # If no approval is configured on the environment, this job passes immediately.
+      - deployment: Gate
+        displayName: 'Approval gate — ${{ parameters.environment }}'
+        pool:
+          vmImage: ubuntu-latest
+        environment: ${{ parameters.environment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: none
+                - bash: |
+                    echo "Deployment approved for: ${{ parameters.environment }}"
+                    echo "Image: $(imageRepository):$(imageTag)"
+                    echo "Revision suffix: $(revisionSuffix)"
+                    echo "Requested by: $(Build.RequestedFor)"
+                  displayName: 'Log deployment intent'
+
+      # ── Job 2: Deploy new ACA revision at 0% traffic ───────────────────────
+      - job: DeployRevision
+        displayName: 'Deploy new revision (0% traffic)'
+        dependsOn: Gate
+        pool:
+          vmImage: ubuntu-latest
+        timeoutInMinutes: 15
+        steps:
+          - checkout: none
+
+          - task: AzureCLI@2
+            displayName: 'Create new ACA revision'
+            name: deployStep
+            inputs:
+              azureSubscription: ${{ parameters.azureServiceConnection }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                APP="${{ parameters.containerAppName }}"
+                RG="${{ parameters.resourceGroup }}"
+                IMAGE="$(imageRepository):$(imageTag)"
+                SUFFIX="$(revisionSuffix)"
+                FULL_REVISION="${APP}--${SUFFIX}"
+
+                echo "=== Creating new ACA revision ==="
+                echo "App:              $APP"
+                echo "Resource Group:   $RG"
+                echo "Image:            $IMAGE"
+                echo "Revision:         $FULL_REVISION"
+                echo "Environment:      ${{ parameters.environment }}"
+
+                # Ensure the app is in multiple-revision mode.
+                # Required for blue-green — without this, ACA uses single-revision mode
+                # and new deploys immediately replace the old revision.
+                az containerapp revision set-mode \
+                  --name "$APP" \
+                  --resource-group "$RG" \
+                  --mode multiple \
+                  --output none
+
+                # Capture the current 100%-traffic revision before we change anything.
+                # This is stored as an output variable so Rollback can restore it.
+                PREV_REVISION=$(
+                  az containerapp ingress traffic show \
+                    --name "$APP" \
+                    --resource-group "$RG" \
+                    --query "[?weight == \`100\`].revisionName | [0]" \
+                    --output tsv 2>/dev/null || echo ""
+                )
+                echo "Previous active revision: ${PREV_REVISION:-none}"
+                echo "##vso[task.setvariable variable=previousRevision;isOutput=true]${PREV_REVISION}"
+
+                # Deploy the new revision.
+                # ACA creates the revision and starts it. By default in multiple-revision
+                # mode, new revisions start deactivated (0% traffic). We verify this
+                # by checking running state before we flip traffic.
+                az containerapp update \
+                  --name "$APP" \
+                  --resource-group "$RG" \
+                  --image "$IMAGE" \
+                  --revision-suffix "$SUFFIX" \
+                  --output none
+
+                echo "Revision created: $FULL_REVISION"
+
+                # Wait for the revision to reach Running state.
+                # Running means ACA's health probes have passed — the container is
+                # accepting connections. Fail fast if it enters Failed/Stopped state.
+                echo "Waiting for revision to reach Running state..."
+                MAX=24  # 24 attempts × 15s = 6 minutes max
+                for attempt in $(seq 1 $MAX); do
+                  STATE=$(
+                    az containerapp revision show \
+                      --name "$APP" \
+                      --resource-group "$RG" \
+                      --revision "$FULL_REVISION" \
+                      --query "properties.runningState" \
+                      --output tsv 2>/dev/null || echo "Provisioning"
+                  )
+
+                  echo "  [$attempt/$MAX] runningState=$STATE"
+
+                  if [ "$STATE" = "Running" ]; then
+                    echo "Revision is Running. Proceeding to traffic flip."
+                    break
+                  fi
+
+                  if [ "$STATE" = "Failed" ] || [ "$STATE" = "Stopped" ]; then
+                    echo "##vso[task.logissue type=error]Revision entered state '$STATE'. Deployment failed."
+                    echo "Container logs (last 100 lines):"
+                    az containerapp logs show \
+                      --name "$APP" \
+                      --resource-group "$RG" \
+                      --revision "$FULL_REVISION" \
+                      --tail 100 || true
+                    exit 1
+                  fi
+
+                  if [ "$attempt" -eq "$MAX" ]; then
+                    echo "##vso[task.logissue type=error]Timed out waiting for revision to start. Check ACA logs."
+                    exit 1
+                  fi
+
+                  sleep 15
+                done
+
+      # ── Job 3: Flip 100% traffic to the new revision ───────────────────────
+      - job: FlipTraffic
+        displayName: 'Flip traffic to new revision'
+        dependsOn: DeployRevision
+        pool:
+          vmImage: ubuntu-latest
+        timeoutInMinutes: 5
+        steps:
+          - checkout: none
+
+          - task: AzureCLI@2
+            displayName: 'Route 100% traffic → new revision'
+            inputs:
+              azureSubscription: ${{ parameters.azureServiceConnection }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                APP="${{ parameters.containerAppName }}"
+                RG="${{ parameters.resourceGroup }}"
+                NEW_REVISION="${APP}--$(revisionSuffix)"
+
+                echo "Flipping traffic to: $NEW_REVISION"
+
+                az containerapp ingress traffic set \
+                  --name "$APP" \
+                  --resource-group "$RG" \
+                  --revision-weight "$NEW_REVISION=100" \
+                  --output none
+
+                echo "Traffic 100% → $NEW_REVISION"
+
+      # ── Job 4: Smoke test — validate health after traffic flip ─────────────
+      - job: SmokeTest
+        displayName: 'Smoke test'
+        dependsOn: FlipTraffic
+        pool:
+          vmImage: ubuntu-latest
+        timeoutInMinutes: 10
+        steps:
+          - checkout: none
+
+          - task: AzureCLI@2
+            displayName: 'HTTP health check'
+            inputs:
+              azureSubscription: ${{ parameters.azureServiceConnection }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                APP="${{ parameters.containerAppName }}"
+                RG="${{ parameters.resourceGroup }}"
+                HEALTH_PATH="${{ parameters.healthCheckPath }}"
+
+                FQDN=$(
+                  az containerapp show \
+                    --name "$APP" \
+                    --resource-group "$RG" \
+                    --query "properties.configuration.ingress.fqdn" \
+                    --output tsv
+                )
+
+                URL="https://${FQDN}${HEALTH_PATH}"
+
+                echo "=== Smoke Test ==="
+                echo "Revision: ${APP}--$(revisionSuffix)"
+                echo "URL:      $URL"
+
+                LAST_STATUS="000"
+                for attempt in $(seq 1 10); do
+                  HTTP_STATUS=$(
+                    curl --silent \
+                         --output /dev/null \
+                         --write-out "%{http_code}" \
+                         --max-time 10 \
+                         --connect-timeout 5 \
+                         "$URL" || echo "000"
+                  )
+
+                  LAST_STATUS="$HTTP_STATUS"
+                  echo "  [$attempt/10] HTTP $HTTP_STATUS"
+
+                  if [ "$HTTP_STATUS" = "200" ]; then
+                    echo "Smoke test passed (HTTP 200)."
+                    exit 0
+                  fi
+
+                  [ "$attempt" -lt 10 ] && sleep 15
+                done
+
+                echo "##vso[task.logissue type=error]Smoke test failed after 10 attempts. Last status: $LAST_STATUS"
+                echo "##vso[task.logissue type=error]URL: $URL — check ACA logs for errors."
+                exit 1
+
+      # ── Job 5: Rollback — only runs if SmokeTest fails ─────────────────────
+      # This job is the safety net. It restores the previous revision immediately
+      # and deactivates the bad one. The job exits with code 1 so the pipeline
+      # remains red — a silent rollback that shows green would be dangerous.
+      - job: Rollback
+        displayName: 'ROLLBACK — restore previous revision'
+        dependsOn:
+          - DeployRevision   # need output variable: previousRevision
+          - SmokeTest        # trigger condition: SmokeTest must have failed
+        condition: and(failed('SmokeTest'), succeeded('DeployRevision'))
+        pool:
+          vmImage: ubuntu-latest
+        timeoutInMinutes: 5
+        variables:
+          # Output variable from DeployRevision — the revision that was live before this deploy
+          previousRevision: $[ dependencies.DeployRevision.outputs['deployStep.previousRevision'] ]
+        steps:
+          - checkout: none
+
+          - task: AzureCLI@2
+            displayName: 'Restore previous revision'
+            inputs:
+              azureSubscription: ${{ parameters.azureServiceConnection }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                APP="${{ parameters.containerAppName }}"
+                RG="${{ parameters.resourceGroup }}"
+                NEW_REVISION="${APP}--$(revisionSuffix)"
+                PREV_REVISION="$(previousRevision)"
+
+                echo "=== ROLLBACK TRIGGERED ==="
+                echo "Environment:         ${{ parameters.environment }}"
+                echo "Reverting to:        ${PREV_REVISION:-UNKNOWN}"
+                echo "Deactivating:        $NEW_REVISION"
+                echo "Build:               $(Build.BuildId)"
+                echo "Triggered by:        $(Build.RequestedFor)"
+
+                if [ -z "$PREV_REVISION" ]; then
+                  echo "##vso[task.logissue type=error]No previous revision recorded. Cannot auto-rollback."
+                  echo "##vso[task.logissue type=error]Manual action required: check ACA revisions in Azure Portal."
+                  exit 1
+                fi
+
+                # Restore 100% traffic to the previous known-good revision
+                az containerapp ingress traffic set \
+                  --name "$APP" \
+                  --resource-group "$RG" \
+                  --revision-weight "$PREV_REVISION=100" \
+                  --output none
+
+                echo "Traffic restored to: $PREV_REVISION"
+
+                # Deactivate the failed revision so it stops consuming resources
+                az containerapp revision deactivate \
+                  --name "$APP" \
+                  --resource-group "$RG" \
+                  --revision "$NEW_REVISION" \
+                  --output none
+
+                echo "Deactivated failed revision: $NEW_REVISION"
+
+                # Log a visible error so the team sees this in the pipeline summary
+                echo "##vso[task.logissue type=error]ROLLBACK COMPLETE: Deployment to '${{ parameters.environment }}' was rolled back."
+                echo "##vso[task.logissue type=error]Failed revision: $NEW_REVISION"
+                echo "##vso[task.logissue type=error]Restored revision: $PREV_REVISION"
+                echo "##vso[task.logissue type=error]Investigate: Build $(Build.BuildId) | Commit $(Build.SourceVersion)"
+
+                # Exit 1 — do NOT let a rollback silently pass. The pipeline must be red.
+                exit 1

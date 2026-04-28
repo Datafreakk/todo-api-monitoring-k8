@@ -1,0 +1,160 @@
+# =============================================================================
+# templates/stages/build.yml
+# CI stage: build Docker image, scan for vulnerabilities, push to ACR.
+#
+# Consumed by pipelines/aca-service.yml — do not reference directly.
+#
+# Key behaviours:
+#   - Docker layers are cached between pipeline runs (reduces build time)
+#   - Image is tagged with the immutable full Git commit SHA
+#   - Trivy scan runs BEFORE push — a failed scan blocks the image from ACR
+#   - Push only happens on main and release/* branches, not on PR builds
+#   - Image metadata (SHA, branch, build ID) is baked into Docker labels
+# =============================================================================
+
+parameters:
+  - name: serviceName
+    type: string
+  - name: acrName
+    type: string
+  - name: acrServiceConnection
+    type: string
+  - name: dockerfilePath
+    type: string
+    default: 'Dockerfile'
+  - name: dockerContext
+    type: string
+    default: '.'
+  - name: buildArgs
+    type: string
+    default: ''
+  - name: trivySeverity
+    type: string
+    default: 'CRITICAL,HIGH'
+
+stages:
+  - stage: CI_Build
+    displayName: 'CI — Build, Scan & Push'
+    jobs:
+      - job: BuildScanPush
+        displayName: 'Build · Scan · Push'
+        pool:
+          vmImage: ubuntu-latest
+        timeoutInMinutes: 30
+        steps:
+
+          # ── 1. Checkout ────────────────────────────────────────────────────
+          - checkout: self
+            fetchDepth: 0
+            displayName: 'Checkout source'
+
+          # ── 2. Restore Docker layer cache ──────────────────────────────────
+          # Cache key is scoped to the Dockerfile path so cache is invalidated
+          # when the Dockerfile changes. Falls back to the most recent cache.
+          - task: Cache@2
+            displayName: 'Restore Docker layer cache'
+            inputs:
+              key: 'docker-v1 | "$(Agent.OS)" | "${{ parameters.dockerfilePath }}" | "$(Build.Repository.Name)"'
+              restoreKeys: |
+                docker-v1 | "$(Agent.OS)" | "${{ parameters.dockerfilePath }}"
+                docker-v1 | "$(Agent.OS)"
+              path: /tmp/docker-cache
+              cacheHitVar: DOCKER_CACHE_HIT
+
+          - bash: |
+              if [ -f /tmp/docker-cache/layers.tar ]; then
+                echo "Loading cached Docker layers..."
+                docker load -i /tmp/docker-cache/layers.tar
+                echo "Cache loaded."
+              else
+                echo "No cache file found — full build required."
+              fi
+            displayName: 'Load cached Docker layers'
+            condition: eq(variables.DOCKER_CACHE_HIT, 'true')
+
+          # ── 3. Build Docker image ──────────────────────────────────────────
+          # Uses $(imageRepository) and $(imageTag) — pipeline-level variables
+          # defined in aca-service.yml, available in all stages automatically.
+          - bash: |
+              set -euo pipefail
+
+              BUILD_ARG_FLAGS=""
+              if [ -n "${BUILD_ARGS:-}" ]; then
+                for arg in $BUILD_ARGS; do
+                  BUILD_ARG_FLAGS="$BUILD_ARG_FLAGS --build-arg $arg"
+                done
+              fi
+
+              echo "=== Building Docker image ==="
+              echo "Image:    $(imageRepository):$(imageTag)"
+              echo "Branch:   $(Build.SourceBranchName)"
+              echo "Build ID: $(Build.BuildId)"
+
+              docker build \
+                -f "$DOCKERFILE_PATH" \
+                -t "$(imageRepository):$(imageTag)" \
+                -t "$(imageRepository):latest-$(Build.SourceBranchName)" \
+                --label "com.company.build.id=$(Build.BuildId)" \
+                --label "com.company.build.sha=$(Build.SourceVersion)" \
+                --label "com.company.build.repo=$(Build.Repository.Name)" \
+                --label "com.company.build.branch=$(Build.SourceBranch)" \
+                --label "com.company.build.requestedfor=$(Build.RequestedFor)" \
+                $BUILD_ARG_FLAGS \
+                "$DOCKER_CONTEXT"
+
+              echo "Build complete: $(imageRepository):$(imageTag)"
+            displayName: 'Build Docker image'
+            env:
+              DOCKERFILE_PATH: ${{ parameters.dockerfilePath }}
+              DOCKER_CONTEXT: ${{ parameters.dockerContext }}
+              BUILD_ARGS: ${{ parameters.buildArgs }}
+
+          # ── 4. Save Docker layer cache ─────────────────────────────────────
+          - bash: |
+              mkdir -p /tmp/docker-cache
+              docker save "$(imageRepository):$(imageTag)" -o /tmp/docker-cache/layers.tar
+              echo "Cache saved."
+            displayName: 'Save Docker layer cache'
+            condition: ne(variables.DOCKER_CACHE_HIT, 'true')
+
+          # ── 5. Trivy vulnerability scan ────────────────────────────────────
+          # Build fails here if CRITICAL or HIGH CVEs are found.
+          # Scan runs against the local image — before it reaches ACR.
+          - template: ../steps/trivy-scan.yml
+            parameters:
+              severity: ${{ parameters.trivySeverity }}
+
+          # ── 6. Push to ACR (main and release branches only) ───────────────
+          # PR builds skip this step — they validate without polluting the registry.
+          # The service connection uses Workload Identity Federation (no stored secret).
+          - task: Docker@2
+            displayName: 'Push image to ACR'
+            condition: |
+              and(
+                succeeded(),
+                or(
+                  eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+                  startsWith(variables['Build.SourceBranch'], 'refs/heads/release/')
+                )
+              )
+            inputs:
+              command: push
+              containerRegistry: ${{ parameters.acrServiceConnection }}
+              repository: ${{ parameters.serviceName }}
+              tags: |
+                $(imageTag)
+                latest-$(Build.SourceBranchName)
+
+          # ── 7. Tag the build with image tag for audit trail ────────────────
+          - bash: |
+              echo "##vso[build.addbuildtag]$(imageTag)"
+              echo "Image pushed: $(imageRepository):$(imageTag)"
+            displayName: 'Tag build with image SHA'
+            condition: |
+              and(
+                succeeded(),
+                or(
+                  eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+                  startsWith(variables['Build.SourceBranch'], 'refs/heads/release/')
+                )
+              )
